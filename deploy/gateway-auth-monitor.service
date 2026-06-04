@@ -1,0 +1,16 @@
+[Unit]
+Description=Gateway Authentication Monitor
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/opt/printer_test
+EnvironmentFile=/opt/printer_test/.env
+ExecStart=/opt/printer_test/venv/bin/python3 /opt/printer_test/gateway_auth_monitor.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
