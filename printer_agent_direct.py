@@ -33,7 +33,8 @@ DB_SCHEMA = os.getenv("DB_SCHEMA", "monitoring") # กำหนดค่า Defa
 # SNMP OIDS DEFINITION (Verified for Kyocera Firmware 2024)
 # =====================================================================
 OIDS = {
-    'printer_status': '1.3.6.1.2.1.43.5.1.1.1.1',
+    'hr_device_status': '1.3.6.1.2.1.25.3.2.1.5.1',
+    'hr_printer_status': '1.3.6.1.2.1.25.3.5.1.1.1',
     'counter_total': '1.3.6.1.4.1.1347.43.10.1.1.12.1.1',
     'counter_printer_raw': '1.3.6.1.4.1.1347.42.3.1.1.1.1.1',
     'paper_a3': '1.3.6.1.4.1.1347.43.10.1.1.13.1.1.1',
@@ -41,6 +42,10 @@ OIDS = {
     'toner_max': '1.3.6.1.2.1.43.11.1.1.8.1.1',            
     'toner_current': '1.3.6.1.2.1.43.11.1.1.9.1.1'         
 }
+
+RUNNING_DEVICE_STATUS_CODES = {2, 3}
+ONLINE_PRINTER_STATUS_CODES = {3, 4, 5}
+UNEXPECTED_STATUS_ERROR_CODE = "SNMP_STATUS_UNEXPECTED"
 
 
 def map_snmp_error(error_indication=None, error_status=None, exception=None) -> Tuple[str, str]:
@@ -103,6 +108,37 @@ async def fetch_snmp_value(snmp_engine, transport, oid_str):
     value, _, _ = await fetch_snmp_with_diagnostics(snmp_engine, transport, oid_str)
     return value
 
+
+def evaluate_printer_online_state(device_status, printer_status, status_error_code, printer_name, printer_ip):
+    """Use Host Resources printer status OIDs for online/offline decisions."""
+    if status_error_code is not None:
+        return False, None
+
+    if device_status == 5:
+        return False, None
+
+    if device_status in RUNNING_DEVICE_STATUS_CODES and printer_status in ONLINE_PRINTER_STATUS_CODES:
+        return True, None
+
+    if device_status is None or printer_status is None:
+        return True, (
+            f"Incomplete printer status from {printer_name} ({printer_ip}), "
+            f"device_status={device_status}, printer_status={printer_status}; proceeding because SNMP is reachable"
+        )
+
+    if device_status not in {1, 2, 3, 4, 5} or printer_status not in {1, 2, 3, 4, 5}:
+        warning = (
+            f"Unexpected printer status from {printer_name} ({printer_ip}), "
+            f"device_status={device_status}, printer_status={printer_status}; proceeding because SNMP is reachable"
+        )
+        return True, warning
+
+    warning = (
+        f"Atypical printer state from {printer_name} ({printer_ip}), "
+        f"device_status={device_status}, printer_status={printer_status}; proceeding because SNMP is reachable"
+    )
+    return True, warning
+
 async def process_and_save_printer(db_conn, printer, ip_info):
     """ฟังก์ชันดึงค่า SNMP และทำการ Insert ลงฐานข้อมูลผ่าน Dynamic Schema"""
     printer_id = printer['printer_id']
@@ -115,19 +151,35 @@ async def process_and_save_printer(db_conn, printer, ip_info):
     snmp_engine = SnmpEngine()
     transport = await UdpTransportTarget.create((printer_ip, 161), timeout=2.5, retries=1)
 
-    # ตรวจเช็คสถานะออนไลน์จาก OID สถานะเครื่องพิมพ์ก่อน
-    printer_status, status_error_code, status_error_detail = await fetch_snmp_with_diagnostics(
+    # ตรวจเช็คสถานะออนไลน์จาก Host Resources MIB ก่อน
+    hr_device_status, status_error_code, status_error_detail = await fetch_snmp_with_diagnostics(
         snmp_engine,
         transport,
-        OIDS['printer_status'],
+        OIDS['hr_device_status'],
     )
-    is_online = status_error_code is None and printer_status in {1, 2, 3, 4, 5}
+    hr_printer_status, printer_status_error_code, printer_status_error_detail = await fetch_snmp_with_diagnostics(
+        snmp_engine,
+        transport,
+        OIDS['hr_printer_status'],
+    )
+
+    if status_error_code is None and printer_status_error_code is not None:
+        status_error_code = printer_status_error_code
+        status_error_detail = printer_status_error_detail
+
+    is_online, status_warning = evaluate_printer_online_state(
+        hr_device_status,
+        hr_printer_status,
+        status_error_code,
+        printer_name,
+        printer_ip,
+    )
 
     if not is_online:
         error_code = status_error_code or "SNMP_STATUS_UNKNOWN"
         error_log = status_error_detail or (
-            f"Unexpected printer status from {printer_name} ({printer_ip}), "
-            f"status={printer_status}"
+            f"Printer offline or unavailable for {printer_name} ({printer_ip}), "
+            f"device_status={hr_device_status}, printer_status={hr_printer_status}"
         )
         print(f"❌ [WARNING] ไม่สามารถติดต่อเครื่องพิมพ์ {printer_name} ได้ -> บันทึกสถานะ offline")
 
@@ -158,6 +210,12 @@ async def process_and_save_printer(db_conn, printer, ip_info):
             db_conn.rollback()
             print(f"❌ [INSERT ERROR] (DB_INSERT_ERROR) บันทึกสถานะ offline ไม่สำเร็จ: {save_err}")
         return
+
+    if status_warning:
+        print(f"⚠️ [STATUS WARNING] {status_warning}")
+
+    success_error_log = status_warning
+    success_error_code = UNEXPECTED_STATUS_ERROR_CODE if status_warning else None
 
     # ยิงดึงค่าอื่นต่อเมื่อเครื่องออนไลน์
     total_all = await fetch_snmp_value(snmp_engine, transport, OIDS['counter_total'])
@@ -207,7 +265,7 @@ async def process_and_save_printer(db_conn, printer, ip_info):
             a3_count, a4_count, legal_count, other_papers,
             scan_copy_actual, 0, scan_other_actual, scanned_total_actual,
             toner_percent, ip_info['public_ip'], ip_info['private_ip'],
-            None, None, True
+            success_error_log, success_error_code, True
         ))
         
         db_conn.commit()
