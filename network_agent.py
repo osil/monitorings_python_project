@@ -1,8 +1,10 @@
 import os
+import time
 import psycopg2
 from dotenv import load_dotenv
 import speedtest
 from main import get_ip_info
+from gateway_auth_monitor import check_internet, login_gateway, load_gateway_credentials
 
 # โหลดค่าคอนฟิกจากไฟล์ .env
 load_dotenv()
@@ -128,8 +130,51 @@ def save_to_db(metrics, test_location, error_log=None, error_code=None):
         db_error_code = "DB_CONNECTION_ERROR" if isinstance(db_err, psycopg2.OperationalError) else "DB_INSERT_ERROR"
         print(f"❌ [DATABASE ERROR] ({db_error_code}) ไม่สามารถบันทึกข้อมูลได้: {db_err}")
 
+def ensure_internet_connection():
+    """ตรวจสอบการเชื่อมต่ออินเทอร์เน็ต หากไม่ได้เชื่อมต่อ ให้ยืนยันตัวตนกับเกตเวย์ก่อน"""
+    print("🔍 กำลังตรวจสอบการเชื่อมต่ออินเทอร์เน็ต...")
+    
+    if check_internet():
+        print("✅ การเชื่อมต่ออินเทอร์เน็ตพร้อมใช้งาน")
+        return True
+    
+    print("❌ ไม่พบการเชื่อมต่ออินเทอร์เน็ต กำลังยืนยันตัวตนกับเกตเวย์...")
+    
+    try:
+        username, password = load_gateway_credentials()
+        print(f"🔐 กำลังเข้าสู่ระบบเกตเวย์ด้วยบัญชี: {username}")
+        
+        if login_gateway(username, password):
+            print("⏳ รอให้ระบบยืนยันตัวตนเสร็จสิ้น...")
+            time.sleep(5)  # รอให้ authentication สำเร็จ
+            
+            # ตรวจสอบอีกครั้งว่าเชื่อมต่ออินเทอร์เน็ตได้แล้ว
+            if check_internet():
+                print("✅ เชื่อมต่ออินเทอร์เน็ตสำเร็จ")
+                return True
+            else:
+                print("⚠️  ยืนยันตัวตนเสร็จสิ้น แต่ยังไม่พบการเชื่อมต่ออินเทอร์เน็ต")
+                return False
+        else:
+            print("❌ ไม่สามารถยืนยันตัวตนกับเกตเวย์ได้")
+            return False
+            
+    except ValueError as e:
+        print(f"❌ ข้อผิดพลาด: {e}")
+        return False
+    except Exception as e:
+        print(f"❌ ข้อผิดพลาดในการยืนยันตัวตน: {e}")
+        return False
+
+
 if __name__ == "__main__":
     print("--- [RMU-UOMS Network Agent] เริ่มต้นระบบทดสอบอินเทอร์เน็ตพร้อมจัดเก็บ IP ---")
+    
+    # -----------------------------------------------------------------
+    # 0. ตรวจสอบการเชื่อมต่ออินเทอร์เน็ต
+    # -----------------------------------------------------------------
+    if not ensure_internet_connection():
+        print("⚠️  คำเตือน: ไม่สามารถตรวจสอบการเชื่อมต่ออินเทอร์เน็ตได้ ดำเนินการต่อไป...")
     
     # -----------------------------------------------------------------
     # 1. ทดสอบอินเทอร์เน็ตภายในประเทศ (Domestic)
