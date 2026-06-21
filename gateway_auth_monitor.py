@@ -1,4 +1,5 @@
 import os
+import subprocess
 import time
 from datetime import datetime
 from pathlib import Path
@@ -35,7 +36,34 @@ def log(message: str) -> None:
             log_file.write(formatted + "\n")
 
 
+def _has_public_ip() -> bool:
+    """Check public IP via ifconfig.me."""
+    try:
+        resp = requests.get("https://ifconfig.me/ip", timeout=5)
+        return resp.status_code == 200 and resp.text.strip() != ""
+    except requests.RequestException:
+        return False
+
+
+def _can_ping_google() -> bool:
+    """Ping google.com once."""
+    try:
+        result = subprocess.run(
+            ["ping", "-c", "1", "-W", "3", "google.com"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=5,
+        )
+        return result.returncode == 0
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return False
+
+
 def check_internet(url: str = DEFAULT_CHECK_URL) -> bool:
+    if _has_public_ip():
+        return True
+    if _can_ping_google():
+        return True
     try:
         requests.get(url, timeout=5)
         return True
